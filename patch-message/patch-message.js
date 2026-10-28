@@ -31,18 +31,6 @@
         return `${location.origin}${location.pathname}?updateId=${getUpdateId(doc)}&type=editUpdate`;
     }
 
-    const ADVISORY_BASE = 'https://security-advisory.wso2.com/dashboard/advisory?name=';
-
-    // Advisory names live in a table with no id - find it by its header.
-    function getAdvisoryNames(doc) {
-        const table = [...doc.querySelectorAll('table')].find(t =>
-            [...t.querySelectorAll('thead th')].some(th => /Security Advisory Names/i.test(th.textContent)));
-        if (!table) return [];
-        return [...table.querySelectorAll('tbody td')]
-            .map(td => td.textContent.trim())
-            .filter(name => name && !isNA(name));
-    }
-
     function getInputValue(doc, id) {
         const value = doc.querySelector(`input#${id}`)?.value?.trim();
         return isNA(value) ? null : value;
@@ -55,84 +43,153 @@
     }
 
     function getProductDivs(doc) {
-        return [...doc.querySelectorAll('#compatibleProducts > div[name]')];
+        // Fully applicable products live under #compatibleProducts; products
+        // where only some of the changed files apply get their own
+        // #partialApplicableProducts section instead. Both have the same
+        // per-product file-change table shape, so file-row extraction wants
+        // both - getApplicableComponents queries them separately below to
+        // tell full vs. partial apart.
+        return [
+            ...doc.querySelectorAll('#compatibleProducts > div[name]'),
+            ...doc.querySelectorAll('#partialApplicableProducts > div[name]'),
+        ];
     }
 
-    const WEBAPP_LABELS = { publisher: 'Publisher', devportal: 'Developer', admin: 'Admin' };
+    const ADVISORY_BASE = 'https://security-advisory.wso2.com/dashboard/advisory?name=';
 
-    // Deliverable rows, deduped across product profiles. Columns are
-    // File | Operation | download URL | Identified Method.
-    function getDeliverableRows(doc) {
+    function getSecurityAdvisories(doc) {
+        // No stable id on this panel - locate it by its heading text and
+        // read every row of its (single-column) table. The whole panel is
+        // omitted from the DOM entirely when the update isn't a security fix.
+        const heading = [...doc.querySelectorAll('h2')].find(h => h.textContent.trim() === 'Security Advisories');
+        const panel = heading ? heading.closest('.x_panel') : null;
+        if (!panel) return [];
+        return [...panel.querySelectorAll('tbody tr td')]
+            .map(td => td.textContent.trim())
+            .filter(Boolean);
+    }
+
+    // Anything under "webapps/<portal>/" or "jaggeryapps/<portal>/" is a UI
+    // change to that portal, regardless of what kind of file it is (bundle,
+    // package.json, jsp page, jsx source, ...).
+    const PORTAL_MARKERS = [
+        [/(?:webapps|jaggeryapps)\/devportal\//, 'Developer'],
+        [/(?:webapps|jaggeryapps)\/publisher\//, 'Publisher'],
+        [/(?:webapps|jaggeryapps)\/admin\//, 'Admin'],
+    ];
+
+    function getFileRows(doc) {
         // The same file change is listed once per applicable product
         // profile (wso2am, wso2am-tm, ...) - dedupe across profiles.
+        // Each product also has a separate "Bundles Info Changes" table
+        // (id="budlesInfoChanges" - a WSO2 typo, not "bundles") listing
+        // bundles.info rows keyed by jar name/version, not File/Operation -
+        // exclude it, we only want the file-changes table.
+        // Columns are File | Operation | download URL | Identified Method; a
+        // file counts as manually identified if any profile says so.
         const seen = new Map();
         getProductDivs(doc).forEach(div => {
-            div.querySelectorAll('table tbody tr').forEach(tr => {
+            div.querySelectorAll('table:not(#budlesInfoChanges) tbody tr').forEach(tr => {
                 const cells = [...tr.children].map(td => td.textContent.trim());
                 if (!cells[0]) return;
                 const key = `${cells[1] || ''}::${cells[0]}`;
-                if (!seen.has(key)) seen.set(key, { file: cells[0], operation: cells[1] || '', method: cells[3] || '' });
+                const manual = /^manual$/i.test(cells[3] || '');
+                if (!seen.has(key)) seen.set(key, { file: cells[0], operation: cells[1] || '', manual });
+                else if (manual) seen.get(key).manual = true;
             });
         });
         return [...seen.values()];
     }
 
-    function getDeliverables(doc) {
-        const rows = getDeliverableRows(doc);
-        if (rows.length === 0) return null;
+    // Splits every changed file into: portal UI changes (summarized as
+    // "UI(<portal> portal)"), .jar/.war deliverables, and manual files -
+    // those UMT identified manually rather than auto-detected, plus
+    // everything else (config/xml/scripts/...), which needs manual handling
+    // on the box. Each file lands in exactly one of these, manual first.
+    function classifyRows(doc) {
+        const portals = new Set();
+        const deliverableRows = [];
+        const manualRows = [];
 
-        // Portal UI updates touch dozens of files under "webapps/<app>/..."
-        // (bundles, package.json, locales, jsp pages) - summarize those as
-        // "UI(<portal> portal)" instead of listing every row.
-        const webapps = new Set();
-        const allWebapp = rows.every(row => {
-            const match = row.file.match(/webapps\/([^/]+)\//);
-            if (match) webapps.add(match[1]);
-            return !!match;
+        getFileRows(doc).forEach(row => {
+            const marker = PORTAL_MARKERS.find(([pattern]) => pattern.test(row.file));
+            if (row.manual) {
+                manualRows.push(row);
+            } else if (marker) {
+                portals.add(marker[1]);
+            } else if (/\.(jar|war)$/i.test(row.file)) {
+                deliverableRows.push(row);
+            } else {
+                manualRows.push(row);
+            }
         });
 
-        if (allWebapp && webapps.size > 0) {
-            const labels = [...webapps].map(name => WEBAPP_LABELS[name] || (name.charAt(0).toUpperCase() + name.slice(1)));
-            return `UI(${labels.join(', ')} portal)`;
-        }
+        return { portals, deliverableRows, manualRows };
+    }
 
-        // Group files under their operation ("Modified:", "Added:", ...),
-        // keeping the order each operation was first seen in.
-        const groups = new Map();
+    // Groups rows into "<label>:" bullet lists, in a fixed label order,
+    // skipping any that are empty. `labelFor` maps a row's raw DOM
+    // operation (Modified/Added/Removed) to the display label to group by.
+    function groupRowsByOperation(rows, orderedLabels, labelFor) {
+        const byLabel = new Map();
         rows.forEach(row => {
-            const op = row.operation || 'Other';
-            if (!groups.has(op)) groups.set(op, []);
-            groups.get(op).push(row.file);
+            const label = labelFor(row.operation);
+            if (!byLabel.has(label)) byLabel.set(label, []);
+            byLabel.get(label).push(row.file);
         });
-
-        const out = [];
-        groups.forEach((files, op) => {
-            out.push(`${op}:`);
-            files.forEach(file => out.push(`- ${file}`));
-        });
-        return out.join('\n');
+        const allLabels = [
+            ...orderedLabels,
+            ...[...byLabel.keys()].filter(label => !orderedLabels.includes(label)),
+        ];
+        return allLabels
+            .filter(label => byLabel.has(label))
+            .map(label => `${label}:\n${byLabel.get(label).map(file => `  - ${file}`).join('\n')}`);
     }
 
-    // Files UMT flagged as manually identified rather than auto-detected.
-    // The section is always rendered, empty included, as a reminder to check.
-    function getManualFiles(doc) {
-        return getDeliverableRows(doc)
-            .filter(row => /^manual$/i.test(row.method))
-            .map(row => row.file);
+    function getDeliverables({ portals, deliverableRows }) {
+        const sections = groupRowsByOperation(deliverableRows, ['Modified', 'Added', 'Removed'], op => op || 'Other');
+        if (portals.size > 0) sections.push(`UI(${[...portals].join(', ')} portal)`);
+        return sections.length ? sections.join('\n') : null;
     }
 
-    function getLifecycleStatus(doc) {
-        // Staging build status / Manual testing aren't separate DOM fields -
-        // both are read off the current lifecycle badge (the last
-        // ".wum_badge" span right before the lifecycle-history button).
+    function getManualFiles({ manualRows }) {
+        const sections = groupRowsByOperation(
+            manualRows,
+            ['Modified', 'Added', 'Deleted'],
+            op => (op === 'Removed' ? 'Deleted' : op || 'Other'),
+        );
+        return sections.length ? sections.join('\n') : null;
+    }
+
+    function getClosestEta(doc) {
+        // Best/Most Likely/Worst Case are three estimates for the same
+        // event - only show the soonest one that hasn't already passed
+        // (falling through to the next if it has). If all three are
+        // already in the past, fall back to the latest of them.
+        const candidates = [
+            { label: 'Best Case', date: getInputValue(doc, 'bestCase') },
+            { label: 'Most Likely', date: getInputValue(doc, 'mostLikely') },
+            { label: 'Worst Case', date: getInputValue(doc, 'worstCase') },
+        ].filter(c => c.date);
+        if (candidates.length === 0) return null;
+
+        candidates.sort((a, b) => new Date(a.date) - new Date(b.date));
+
+        const today = new Date();
+        today.setHours(0, 0, 0, 0);
+        return candidates.find(c => new Date(c.date) >= today) || candidates[candidates.length - 1];
+    }
+
+    function hasLifecycleState(doc) {
+        // Staging build status / Manual Testing always print PENDING (they
+        // get updated by hand once actually verified) - this just gates
+        // whether to show those lines at all, by checking a lifecycle badge
+        // is present (the last ".wum_badge" span right before the
+        // lifecycle-history button).
         const anchor = doc.getElementById('btnShowLifecycleStateChangeLogModal');
         let el = anchor ? anchor.previousElementSibling : null;
         while (el && !el.classList.contains('wum_badge')) el = el.previousElementSibling;
-        const state = el ? el.textContent.trim() : null;
-        if (!state) return null;
-
-        const STATE_STATUS_MAP = { Staging: 'PENDING', UATStaging: 'SUCCESS', Completed: 'SUCCESS' };
-        return STATE_STATUS_MAP[state] || state.toUpperCase();
+        return !!(el && el.textContent.trim());
     }
 
     const COMPONENT_LABELS = [
@@ -142,10 +199,33 @@
         ['wso2am-universal-gw', 'UGW'],
     ];
 
+    // The AIO/ACP/TM/UGW product split only exists from APIM 4.5.0 onward -
+    // earlier updates only ever shipped the single wso2am pack, so calling
+    // out "applicable components" there would be meaningless noise. Read the
+    // version off the first row of the products table (every row shares the
+    // same major.minor.patch - only the trailing build number differs per
+    // component).
+    function meetsMinApimVersion(doc, minMajor, minMinor) {
+        const versionText = doc.querySelector('#productTable tbody tr td:nth-child(2)')?.textContent?.trim();
+        const match = versionText && versionText.match(/^(\d+)\.(\d+)/);
+        if (!match) return false;
+        const [major, minor] = [Number(match[1]), Number(match[2])];
+        return major > minMajor || (major === minMajor && minor >= minMinor);
+    }
+
     function getApplicableComponents(doc) {
-        const names = new Set(getProductDivs(doc).map(div => div.getAttribute('name')));
-        if (names.size <= 1) return null; // only the default AIO pack - not worth calling out
-        const labels = COMPONENT_LABELS.filter(([name]) => names.has(name)).map(([, label]) => label);
+        if (!meetsMinApimVersion(doc, 4, 5)) return null;
+        const fullNames = new Set(
+            [...doc.querySelectorAll('#compatibleProducts > div[name]')].map(div => div.getAttribute('name')),
+        );
+        const partialNames = new Set(
+            [...doc.querySelectorAll('#partialApplicableProducts > div[name]')].map(div => div.getAttribute('name')),
+        );
+        if (fullNames.size <= 1 && partialNames.size === 0) return null; // only the default AIO pack - not worth calling out
+        const fullLabels = COMPONENT_LABELS.filter(([name]) => fullNames.has(name)).map(([, label]) => label);
+        const partialLabels = COMPONENT_LABELS.filter(([name]) => partialNames.has(name))
+            .map(([, label]) => `${label} (Partially Applicable)`);
+        const labels = [...fullLabels, ...partialLabels];
         return labels.length ? labels.join(', ') : null;
     }
 
@@ -158,7 +238,7 @@
         const securityIssue = getInputValue(doc, 'securityInternalGitIssue');
         if (securityIssue) lines.push(`Sec-Internal: ${securityIssue}`);
 
-        const advisories = getAdvisoryNames(doc).map(name => ADVISORY_BASE + name);
+        const advisories = getSecurityAdvisories(doc).map(name => ADVISORY_BASE + name);
         if (advisories.length === 1) {
             lines.push(`Advisory: ${advisories[0]}`);
         } else if (advisories.length > 1) {
@@ -174,31 +254,28 @@
             publicIssues.forEach(url => lines.push(`  - ${url}`));
         }
 
-        const deliverables = getDeliverables(doc);
+        const classifiedRows = classifyRows(doc);
+
+        const deliverables = getDeliverables(classifiedRows);
         if (deliverables) {
             lines.push('Deliverables:');
             lines.push(deliverables);
         }
 
+        // Always rendered, empty included, as a reminder to check.
         lines.push('Manual Files:');
-        getManualFiles(doc).forEach(file => lines.push(`- ${file}`));
+        const manualFiles = getManualFiles(classifiedRows);
+        if (manualFiles) lines.push(manualFiles);
 
         const components = getApplicableComponents(doc);
         if (components) lines.push(`Applicable components: ${components}`);
 
-        const bestCase = getInputValue(doc, 'bestCase');
-        if (bestCase) lines.push(`Best Case ETA: ${bestCase}`);
+        const eta = getClosestEta(doc);
+        if (eta) lines.push(`${eta.label} ETA: ${eta.date}`);
 
-        const mostLikely = getInputValue(doc, 'mostLikely');
-        if (mostLikely) lines.push(`Most Likely ETA: ${mostLikely}`);
-
-        const worstCase = getInputValue(doc, 'worstCase');
-        if (worstCase) lines.push(`Worst Case ETA: ${worstCase}`);
-
-        const status = getLifecycleStatus(doc);
-        if (status) {
-            lines.push(`Staging build status: ${status}`);
-            lines.push(`Manual Testing: ${status}`);
+        if (hasLifecycleState(doc)) {
+            lines.push('Staging build status: PENDING');
+            lines.push('Manual Testing: PENDING');
         }
 
         return lines.join('\n');

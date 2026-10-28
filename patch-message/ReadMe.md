@@ -19,7 +19,7 @@ Copy the `patch-message.bookmarklet.txt` snippet to use as your search engine UR
 3. Fill out the fields as follows:
    * **Name:** `Patch Message`
    * **Shortcut:** `pm` *(or your preferred short trigger)*
-   * **URL:** Paste the JavaScript code block above.
+   * **URL:** Paste the content of `patch-message.bookmarklet.txt` into it.
 4. Click **Save**.
 
 ---
@@ -30,3 +30,17 @@ When you are on the UMT view update page:
 
 1. Press **`Cmd + L`** (Mac) or **`Ctrl + L`** (Windows) to highlight the address bar.
 2. Type **`pm`** and press **`Enter`**.
+3. The Update description will be copied to your clipboard and also logged in the browser console (in case of clipboard permission issues)
+  e.g 
+  ```
+  U2: 19763
+Internal Issue: <issue link>
+Public Issue: https://github.com/wso2/api-manager/issues/<issue-no>
+Deliverables:
+Modified:
+  - repository/components/plugins/org.wso2.carbon.apimgt.impl_9.27.188.jar
+Most Likely ETA: 2026-09-24
+Staging build status: SUCCESS
+Manual Testing: PENDING
+Applicable components: AIO, ACP, TM, UGW
+  ```
