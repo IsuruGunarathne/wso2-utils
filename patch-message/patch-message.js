@@ -25,6 +25,24 @@
         return 'UNKNOWN';
     }
 
+    // The message links the editable view, not the read-only one it is
+    // generated from.
+    function getUpdateUrl(doc) {
+        return `${location.origin}${location.pathname}?updateId=${getUpdateId(doc)}&type=editUpdate`;
+    }
+
+    const ADVISORY_BASE = 'https://security-advisory.wso2.com/dashboard/advisory?name=';
+
+    // Advisory names live in a table with no id - find it by its header.
+    function getAdvisoryNames(doc) {
+        const table = [...doc.querySelectorAll('table')].find(t =>
+            [...t.querySelectorAll('thead th')].some(th => /Security Advisory Names/i.test(th.textContent)));
+        if (!table) return [];
+        return [...table.querySelectorAll('tbody td')]
+            .map(td => td.textContent.trim())
+            .filter(name => name && !isNA(name));
+    }
+
     function getInputValue(doc, id) {
         const value = doc.querySelector(`input#${id}`)?.value?.trim();
         return isNA(value) ? null : value;
@@ -42,7 +60,9 @@
 
     const WEBAPP_LABELS = { publisher: 'Publisher', devportal: 'Developer', admin: 'Admin' };
 
-    function getDeliverables(doc) {
+    // Deliverable rows, deduped across product profiles. Columns are
+    // File | Operation | download URL | Identified Method.
+    function getDeliverableRows(doc) {
         // The same file change is listed once per applicable product
         // profile (wso2am, wso2am-tm, ...) - dedupe across profiles.
         const seen = new Map();
@@ -51,10 +71,14 @@
                 const cells = [...tr.children].map(td => td.textContent.trim());
                 if (!cells[0]) return;
                 const key = `${cells[1] || ''}::${cells[0]}`;
-                if (!seen.has(key)) seen.set(key, { file: cells[0], operation: cells[1] || '' });
+                if (!seen.has(key)) seen.set(key, { file: cells[0], operation: cells[1] || '', method: cells[3] || '' });
             });
         });
-        const rows = [...seen.values()];
+        return [...seen.values()];
+    }
+
+    function getDeliverables(doc) {
+        const rows = getDeliverableRows(doc);
         if (rows.length === 0) return null;
 
         // Portal UI updates touch dozens of files under "webapps/<app>/..."
@@ -72,7 +96,29 @@
             return `UI(${labels.join(', ')} portal)`;
         }
 
-        return rows.map(row => `${row.operation} ${row.file}`.trim()).join('\n');
+        // Group files under their operation ("Modified:", "Added:", ...),
+        // keeping the order each operation was first seen in.
+        const groups = new Map();
+        rows.forEach(row => {
+            const op = row.operation || 'Other';
+            if (!groups.has(op)) groups.set(op, []);
+            groups.get(op).push(row.file);
+        });
+
+        const out = [];
+        groups.forEach((files, op) => {
+            out.push(`${op}:`);
+            files.forEach(file => out.push(`- ${file}`));
+        });
+        return out.join('\n');
+    }
+
+    // Files UMT flagged as manually identified rather than auto-detected.
+    // The section is always rendered, empty included, as a reminder to check.
+    function getManualFiles(doc) {
+        return getDeliverableRows(doc)
+            .filter(row => /^manual$/i.test(row.method))
+            .map(row => row.file);
     }
 
     function getLifecycleStatus(doc) {
@@ -104,13 +150,21 @@
     }
 
     function buildPatchMessage(doc = document) {
-        const lines = [`U2: ${getUpdateId(doc)}`];
+        const lines = [`U2: ${getUpdateUrl(doc)}`];
 
         const internalIssue = getInputValue(doc, 'internalGitIssue');
         if (internalIssue) lines.push(`Internal Issue: ${internalIssue}`);
 
         const securityIssue = getInputValue(doc, 'securityInternalGitIssue');
-        if (securityIssue) lines.push(`Security Internal Issue: ${securityIssue}`);
+        if (securityIssue) lines.push(`Sec-Internal: ${securityIssue}`);
+
+        const advisories = getAdvisoryNames(doc).map(name => ADVISORY_BASE + name);
+        if (advisories.length === 1) {
+            lines.push(`Advisory: ${advisories[0]}`);
+        } else if (advisories.length > 1) {
+            lines.push('Advisory:');
+            advisories.forEach(url => lines.push(`  - ${url}`));
+        }
 
         const publicIssues = getPublicIssues(doc);
         if (publicIssues.length === 1) {
@@ -126,6 +180,12 @@
             lines.push(deliverables);
         }
 
+        lines.push('Manual Files:');
+        getManualFiles(doc).forEach(file => lines.push(`- ${file}`));
+
+        const components = getApplicableComponents(doc);
+        if (components) lines.push(`Applicable components: ${components}`);
+
         const bestCase = getInputValue(doc, 'bestCase');
         if (bestCase) lines.push(`Best Case ETA: ${bestCase}`);
 
@@ -140,9 +200,6 @@
             lines.push(`Staging build status: ${status}`);
             lines.push(`Manual Testing: ${status}`);
         }
-
-        const components = getApplicableComponents(doc);
-        if (components) lines.push(`Applicable components: ${components}`);
 
         return lines.join('\n');
     }
