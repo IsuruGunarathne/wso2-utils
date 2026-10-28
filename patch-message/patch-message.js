@@ -205,11 +205,13 @@
     }
 
     function copyToClipboard(text) {
-        // Snippets usually run without the document itself focused (DevTools
-        // has focus instead), which makes navigator.clipboard.writeText
-        // reject with "Document is not focused". Fall back to the older
-        // execCommand('copy'), which tolerates that better.
-        function fallbackCopy() {
+        // Run from the address bar or a DevTools snippet there is no user
+        // gesture on the page, so execCommand('copy') refuses - and it reports
+        // that by returning false, not by throwing. navigator.clipboard.writeText
+        // can then reject ("Document is not focused") or never settle at all.
+        // So when the immediate copy fails, also copy on the next click on the
+        // page, which is a gesture.
+        function execCopy() {
             const textarea = document.createElement('textarea');
             textarea.value = text;
             textarea.style.position = 'fixed';
@@ -218,22 +220,34 @@
             textarea.focus();
             textarea.select();
             try {
-                document.execCommand('copy');
-                console.log('%cCopied to clipboard.', 'color: #2ecc71');
+                return document.execCommand('copy');
             } catch (err) {
-                console.error('Could not copy to clipboard:', err);
+                return false;
             } finally {
                 document.body.removeChild(textarea);
             }
         }
 
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text)
-                .then(() => console.log('%cCopied to clipboard.', 'color: #2ecc71'))
-                .catch(fallbackCopy);
-        } else {
-            fallbackCopy();
+        let copied = false;
+        function markCopied() {
+            if (copied) return;
+            copied = true;
+            console.log('%cCopied to clipboard.', 'color: #2ecc71');
         }
+
+        if (execCopy()) {
+            markCopied();
+            return;
+        }
+
+        document.addEventListener('click', () => {
+            if (copied) return;
+            if (execCopy()) markCopied();
+            else console.error('Could not copy to clipboard - copy the message above instead.');
+        }, { once: true, capture: true });
+        console.log('%cIf the clipboard was not updated, click anywhere on the page to copy.', 'color: #e67e22');
+
+        navigator.clipboard?.writeText(text).then(markCopied, () => {});
     }
 
     // Expose for ad-hoc re-runs from the console without re-pasting the snippet.
