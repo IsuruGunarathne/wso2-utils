@@ -25,6 +25,12 @@
         return 'UNKNOWN';
     }
 
+    // The message links the editable view, not the read-only one it is
+    // generated from.
+    function getUpdateUrl(doc) {
+        return `${location.origin}${location.pathname}?updateId=${getUpdateId(doc)}&type=editUpdate`;
+    }
+
     function getInputValue(doc, id) {
         const value = doc.querySelector(`input#${id}`)?.value?.trim();
         return isNA(value) ? null : value;
@@ -48,6 +54,8 @@
             ...doc.querySelectorAll('#partialApplicableProducts > div[name]'),
         ];
     }
+
+    const ADVISORY_BASE = 'https://security-advisory.wso2.com/dashboard/advisory?name=';
 
     function getSecurityAdvisories(doc) {
         // No stable id on this panel - locate it by its heading text and
@@ -77,21 +85,27 @@
         // (id="budlesInfoChanges" - a WSO2 typo, not "bundles") listing
         // bundles.info rows keyed by jar name/version, not File/Operation -
         // exclude it, we only want the file-changes table.
+        // Columns are File | Operation | download URL | Identified Method; a
+        // file counts as manually identified if any profile says so.
         const seen = new Map();
         getProductDivs(doc).forEach(div => {
             div.querySelectorAll('table:not(#budlesInfoChanges) tbody tr').forEach(tr => {
                 const cells = [...tr.children].map(td => td.textContent.trim());
                 if (!cells[0]) return;
                 const key = `${cells[1] || ''}::${cells[0]}`;
-                if (!seen.has(key)) seen.set(key, { file: cells[0], operation: cells[1] || '' });
+                const manual = /^manual$/i.test(cells[3] || '');
+                if (!seen.has(key)) seen.set(key, { file: cells[0], operation: cells[1] || '', manual });
+                else if (manual) seen.get(key).manual = true;
             });
         });
         return [...seen.values()];
     }
 
     // Splits every changed file into: portal UI changes (summarized as
-    // "UI(<portal> portal)"), .jar/.war deliverables, and everything else
-    // (config/xml/scripts/...), which needs manual handling on the box.
+    // "UI(<portal> portal)"), .jar/.war deliverables, and manual files -
+    // those UMT identified manually rather than auto-detected, plus
+    // everything else (config/xml/scripts/...), which needs manual handling
+    // on the box. Each file lands in exactly one of these, manual first.
     function classifyRows(doc) {
         const portals = new Set();
         const deliverableRows = [];
@@ -99,7 +113,9 @@
 
         getFileRows(doc).forEach(row => {
             const marker = PORTAL_MARKERS.find(([pattern]) => pattern.test(row.file));
-            if (marker) {
+            if (row.manual) {
+                manualRows.push(row);
+            } else if (marker) {
                 portals.add(marker[1]);
             } else if (/\.(jar|war)$/i.test(row.file)) {
                 deliverableRows.push(row);
@@ -214,20 +230,20 @@
     }
 
     function buildPatchMessage(doc = document) {
-        const lines = [`U2: ${getUpdateId(doc)}`];
+        const lines = [`U2: ${getUpdateUrl(doc)}`];
 
         const internalIssue = getInputValue(doc, 'internalGitIssue');
         if (internalIssue) lines.push(`Internal Issue: ${internalIssue}`);
 
         const securityIssue = getInputValue(doc, 'securityInternalGitIssue');
-        if (securityIssue) lines.push(`Security Internal Issue: ${securityIssue}`);
+        if (securityIssue) lines.push(`Sec-Internal: ${securityIssue}`);
 
-        const securityAdvisories = getSecurityAdvisories(doc);
-        if (securityAdvisories.length === 1) {
-            lines.push(`Security Advisory: ${securityAdvisories[0]}`);
-        } else if (securityAdvisories.length > 1) {
-            lines.push('Security Advisory:');
-            securityAdvisories.forEach(name => lines.push(`  - ${name}`));
+        const advisories = getSecurityAdvisories(doc).map(name => ADVISORY_BASE + name);
+        if (advisories.length === 1) {
+            lines.push(`Advisory: ${advisories[0]}`);
+        } else if (advisories.length > 1) {
+            lines.push('Advisory:');
+            advisories.forEach(url => lines.push(`  - ${url}`));
         }
 
         const publicIssues = getPublicIssues(doc);
@@ -246,11 +262,13 @@
             lines.push(deliverables);
         }
 
+        // Always rendered, empty included, as a reminder to check.
+        lines.push('Manual Files:');
         const manualFiles = getManualFiles(classifiedRows);
-        if (manualFiles) {
-            lines.push('Manual Files:');
-            lines.push(manualFiles);
-        }
+        if (manualFiles) lines.push(manualFiles);
+
+        const components = getApplicableComponents(doc);
+        if (components) lines.push(`Applicable components: ${components}`);
 
         const eta = getClosestEta(doc);
         if (eta) lines.push(`${eta.label} ETA: ${eta.date}`);
@@ -260,18 +278,17 @@
             lines.push('Manual Testing: PENDING');
         }
 
-        const components = getApplicableComponents(doc);
-        if (components) lines.push(`Applicable components: ${components}`);
-
         return lines.join('\n');
     }
 
     function copyToClipboard(text) {
-        // Snippets usually run without the document itself focused (DevTools
-        // has focus instead), which makes navigator.clipboard.writeText
-        // reject with "Document is not focused". Fall back to the older
-        // execCommand('copy'), which tolerates that better.
-        function fallbackCopy() {
+        // Run from the address bar or a DevTools snippet there is no user
+        // gesture on the page, so execCommand('copy') refuses - and it reports
+        // that by returning false, not by throwing. navigator.clipboard.writeText
+        // can then reject ("Document is not focused") or never settle at all.
+        // So when the immediate copy fails, also copy on the next click on the
+        // page, which is a gesture.
+        function execCopy() {
             const textarea = document.createElement('textarea');
             textarea.value = text;
             textarea.style.position = 'fixed';
@@ -280,22 +297,34 @@
             textarea.focus();
             textarea.select();
             try {
-                document.execCommand('copy');
-                console.log('%cCopied to clipboard.', 'color: #2ecc71');
+                return document.execCommand('copy');
             } catch (err) {
-                console.error('Could not copy to clipboard:', err);
+                return false;
             } finally {
                 document.body.removeChild(textarea);
             }
         }
 
-        if (navigator.clipboard && navigator.clipboard.writeText) {
-            navigator.clipboard.writeText(text)
-                .then(() => console.log('%cCopied to clipboard.', 'color: #2ecc71'))
-                .catch(fallbackCopy);
-        } else {
-            fallbackCopy();
+        let copied = false;
+        function markCopied() {
+            if (copied) return;
+            copied = true;
+            console.log('%cCopied to clipboard.', 'color: #2ecc71');
         }
+
+        if (execCopy()) {
+            markCopied();
+            return;
+        }
+
+        document.addEventListener('click', () => {
+            if (copied) return;
+            if (execCopy()) markCopied();
+            else console.error('Could not copy to clipboard - copy the message above instead.');
+        }, { once: true, capture: true });
+        console.log('%cIf the clipboard was not updated, click anywhere on the page to copy.', 'color: #e67e22');
+
+        navigator.clipboard?.writeText(text).then(markCopied, () => {});
     }
 
     // Expose for ad-hoc re-runs from the console without re-pasting the snippet.
